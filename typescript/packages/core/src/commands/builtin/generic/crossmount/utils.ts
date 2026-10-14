@@ -186,6 +186,7 @@ export function transferLinksOf(
   dispatch: DispatchFn,
   cwd: string,
   visibility: Visibility | undefined,
+  owns?: (virtual: string) => boolean,
 ): TransferLinks {
   const relayStat = statOp(dispatch)
   return {
@@ -193,6 +194,7 @@ export function transferLinksOf(
     dispatch,
     cwd,
     ...(visibility !== undefined ? { visibility } : {}),
+    ...(owns !== undefined ? { owns } : {}),
     relay: {
       readBytes: readBytesOp(dispatch),
       write: async (p: PathSpec, data: Uint8Array) => {
