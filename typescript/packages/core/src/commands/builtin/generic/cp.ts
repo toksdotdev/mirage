@@ -330,7 +330,8 @@ export function destStat(stat: StatFn, links: LinkView): StatFn {
  * router follows a destination to what its link leads to, which is what a plain
  * copy writes, through the link. GNU's backup renames the destination itself, a
  * link included, and the copy then lands at the name, so a backup is made of
- * this and the copy goes here. Mirrors Python's link_name.
+ * this and the copy goes here, through the dispatcher: the name may sit on
+ * another mount than the one the link leads into. Mirrors Python's link_name.
  */
 export function linkName(copies: TransferLinks, target: PathSpec): PathSpec | null {
   const where = nameLocation(copies.links, target, copies.cwd)
@@ -1711,11 +1712,13 @@ export async function cpGeneric(
       continue
     }
     const linked = copies !== undefined && policy.backup !== null ? linkName(copies, target) : null
+    let copier: CopyStrategy = strategy
     let made: Awaited<ReturnType<typeof makeBackup>>
     if (copies !== undefined && linked !== null) {
       // GNU's backup renames the link at the name, and the copy is then a new
       // file there; what the link led to is untouched.
       target = linked
+      copier = copies.relay
       made = await makeBackup(
         policy,
         { rename: (a: PathSpec, b: PathSpec) => renameLink(copies, a, b) },
@@ -1731,18 +1734,18 @@ export async function cpGeneric(
     }
     if (!made.ok) continue
     if (flags.verbose) lines.push(transferLine(src, target, made.backup))
-    if (isPrimitiveCopy(strategy)) {
+    if (isPrimitiveCopy(copier)) {
       let data: Uint8Array
       try {
         // write takes bytes, not a stream: the file is materialized here.
-        data = await strategy.readBytes(src)
+        data = await copier.readBytes(src)
       } catch (err) {
         if (!isFsError(err)) throw err
         errors.push(`cp: cannot open '${src.rawPath}' for reading: ${String(fsStrerror(err))}`)
         continue
       }
       try {
-        await strategy.write(target, data)
+        await copier.write(target, data)
       } catch (err) {
         if (!isFsError(err)) throw err
         errors.push(
@@ -1752,7 +1755,7 @@ export async function cpGeneric(
       }
     } else {
       try {
-        await strategy.copy(src, target)
+        await copier.copy(src, target)
       } catch (err) {
         if (!isFsError(err)) throw err
         errors.push(
