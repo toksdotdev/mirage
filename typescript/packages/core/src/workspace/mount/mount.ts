@@ -21,13 +21,13 @@ import { norm } from '../../utils/path.ts'
 import { ContextScope } from '../../utils/context_scope.ts'
 import {
   captureSessionContext,
+  currentCaller,
   effectiveMountMode,
   requirePathsWritable,
-  runWithMountGate,
-  runWithWalkProbe,
+  runWithCaller,
   strongestModeUnder,
 } from '../../context/session_context.ts'
-import { captureOpPolicies } from '../../policy/policies.ts'
+import { captureExecutionContext } from '../../execution/context.ts'
 import { mountKey } from '../../utils/key_prefix.ts'
 import { coerceReadPolicy } from './read_policy.ts'
 import { coerceWritePolicy, writeConditions } from './write_policy.ts'
@@ -73,22 +73,12 @@ import { materialize, type ByteSource, IOResult } from '../../io/types.ts'
 import { OutputStream, closeQuietly } from '../../io/stream.ts'
 import { flagOccurrences } from '../../commands/spec/flag_view.ts'
 import type { CommandSpec, FlagValue } from '../../commands/spec/types.ts'
-import {
-  captureCacheContext,
-  runWithCacheManager,
-  runWithWriteContext,
-} from '../../cache/context.ts'
+import { runWithWriteContext } from '../../cache/context.ts'
 import { type WriteContext } from '../../cache/types.ts'
-import { captureCommandScope } from '../../cache/index/scope.ts'
 import type { CacheManager } from '../../cache/manager.ts'
 import { joinOrAbort, mergeSignals } from '../../utils/abort.ts'
 import { callerSignal } from '../abort.ts'
-import {
-  captureRecordingContext,
-  runWithMountContext,
-  runWithRevisions,
-  withMountContext,
-} from '../../observe/context.ts'
+import { runWithMountContext, runWithRevisions, withMountContext } from '../../observe/context.ts'
 import { uuid7 } from '../../utils/ids.ts'
 import { VFSActivity } from './activity.ts'
 import type { BaseVFS } from '../../vfs/base.ts'
@@ -886,10 +876,7 @@ export class MountEntry {
     const revisions = this.revisions.size > 0 ? this.revisions : null
     const pulls = new ContextScope([
       ...captureSessionContext(),
-      ...captureOpPolicies(),
-      ...captureRecordingContext(),
-      captureCacheContext(),
-      captureCommandScope(),
+      captureExecutionContext(),
       (fn) => runWithWriteContext(this.prefix, this.writeContext(), async () => await fn()),
       (fn) => runWithRevisions(revisions, async () => await fn()),
     ])
@@ -953,13 +940,6 @@ export class MountEntry {
       }
     }
     return this.writeContextFor.context
-  }
-
-  /** The command entry point's cache manager and write context, one scope. */
-  private runWithCaches<T>(fn: () => Promise<T>): Promise<T> {
-    return runWithCacheManager(this.cacheManager, () =>
-      runWithWriteContext(this.prefix, this.writeContext(), fn),
-    )
   }
 
   /**
@@ -1156,16 +1136,21 @@ export class MountEntry {
    * and the snapshot revision pins. Mirrors Python's MountEntry._command_scope.
    */
   private inCommandScope<T>(probe: WalkProbe | null, fn: () => Promise<T>): Promise<T> {
-    const scoped = (): Promise<T> =>
-      runWithMountContext(
-        () =>
-          this.runWithCaches(() =>
-            runWithRevisions(this.revisions.size > 0 ? this.revisions : null, fn),
-          ),
-        this.mountId,
-      )
-    return runWithMountGate(this.prefix, this.mode, () =>
-      probe === null ? scoped() : runWithWalkProbe(this.prefix, probe, scoped),
+    const outer = currentCaller()
+    return runWithCaller(
+      {
+        ...outer,
+        recording:
+          outer.recording === null
+            ? null
+            : { records: outer.recording.records, mountId: this.mountId },
+        revisions: { map: this.revisions.size > 0 ? this.revisions : null },
+        cache: { manager: this.cacheManager },
+        write: { prefix: this.prefix, context: this.writeContext() },
+        mount: [this.prefix, this.mode],
+        walkProbe: probe === null ? outer.walkProbe : [this.prefix, probe],
+      },
+      fn,
     )
   }
 
@@ -1457,13 +1442,7 @@ function wrapMountStreams(
 ): [ByteSource | null, IOResult] {
   const [stream, io] = result
   if (stream === null || stream instanceof Uint8Array) return [stream, io]
-  const scope = new ContextScope([
-    ...captureSessionContext(),
-    ...captureOpPolicies(),
-    ...captureRecordingContext(),
-    captureCacheContext(),
-    captureCommandScope(),
-  ])
+  const scope = new ContextScope([...captureSessionContext(), captureExecutionContext()])
   return [activity.hold(scope.stream(withMountContext(stream, mountId))), io]
 }
 

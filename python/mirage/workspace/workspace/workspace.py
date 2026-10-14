@@ -26,7 +26,6 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -40,16 +39,16 @@ from mirage.bridge.sync import run_async_from_sync
 from mirage.cache.file.config import CacheConfig
 from mirage.cache.file.mixin import FileCacheMixin
 from mirage.cache.index import IndexConfig
-from mirage.commands.builtin.generic_bind.adapter import (
-    with_dispatch_rule_guard,
-)
 from mirage.commands.cli import CLI
 from mirage.commands.cli.specs import cli_spec_for
 from mirage.concurrency.limiter import run_blocking
 from mirage.context import (
-    get_admission,
+    Caller,
+    bind_caller,
+    current_caller,
     get_current_session_for,
     get_current_session_unless_foreign,
+    reset_caller,
     reset_current_session,
     reset_explaining,
     reset_program_invocation,
@@ -223,16 +222,6 @@ from mirage.workspace.workspace.types import VFSMount
 from mirage.workspace.workspace.watch import WatchDelegate, WatchManager
 
 logger = logging.getLogger(__name__)
-
-# The stop event of the top-level line this context runs in, so a line
-# that cancels its own session does not wait on itself.
-LINE_STOP: ContextVar[asyncio.Event | None] = ContextVar(
-    "mirage_line_stop", default=None
-)
-
-# Set inside a write the capture gate let through, so the ops it runs
-# itself are not held behind it.
-WRITE_HELD: ContextVar[bool] = ContextVar("mirage_write_held", default=False)
 
 
 class Workspace:
@@ -2046,7 +2035,7 @@ class Workspace:
             int: how many lines were cancelled.
         """
         default = self._session_mgr.default_id
-        own = LINE_STOP.get()
+        own = current_caller().stop
         hit = [
             (stop, ended)
             for stop, (named, ended) in list(self._lines.items())
@@ -2076,7 +2065,7 @@ class Workspace:
             seconds (float): how long to wait for running lines.
         """
         async with self._capture_lock:
-            own = LINE_STOP.get()
+            own = current_caller().stop
             self._admitting.clear()
             try:
                 waiters = [
@@ -2119,26 +2108,29 @@ class Workspace:
         self._admitted.add(stop)
 
     @asynccontextmanager
-    async def _admit_write(self) -> AsyncIterator[None]:
+    async def _admit_write(self, caller: Caller) -> AsyncIterator[Caller]:
         """Hold a write while a capture reads, unless its line is waited for.
 
         A write from a running top-level line passes: the capture waits
         for that line. Any other (an entry point's file op, SFTP, FUSE, a
         background job) waits for the capture to finish, and counts as
         under way until it ends, so a capture that starts waits it out.
+        The caller handed back holds the admission, so the ops the write
+        runs itself are not held behind it.
+
+        Args:
+            caller (Caller): who makes the write.
         """
-        if WRITE_HELD.get() or LINE_STOP.get() in self._admitted:
-            yield
+        if caller.write_held or caller.stop in self._admitted:
+            yield caller
             return
         while not self._admitting.is_set():
             await self._admitting.wait()
         self._writes += 1
         self._writes_idle.clear()
-        token = WRITE_HELD.set(True)
         try:
-            yield
+            yield replace(caller, write_held=True)
         finally:
-            WRITE_HELD.reset(token)
             self._writes -= 1
             if self._writes == 0:
                 self._writes_idle.set()
@@ -2237,17 +2229,20 @@ class Workspace:
     async def _program_dispatch(
         self, name: str, path: PathSpec, /, **kwargs: Any
     ) -> tuple[Any, IOResult]:
-        """Dispatch a program's own file call with the gate of the command
-        running it, so a rule scoped to ``python3`` reaches its ``open()``.
-        The binding's capture replays that command's context here.
+        """Dispatch a program's own file call as the command running it,
+        its gate included, so a rule scoped to ``python3`` reaches its
+        ``open()``. The binding's capture replays that command's context
+        here.
 
         Args:
             name (str): the op.
             path (PathSpec): the path it reaches.
             **kwargs (Any): the op's arguments.
         """
-        guarded = with_dispatch_rule_guard(self.dispatch, get_admission())
-        return await guarded(name, path, **kwargs)
+        caller = current_caller()
+        return await self.dispatch(
+            name, path, caller=replace(caller, rule_gate=caller.gate), **kwargs
+        )
 
     async def stat(self, path: str) -> FileStat:
         scope = PathSpec(
@@ -2615,7 +2610,7 @@ class Workspace:
         if handed is None:
             stop = asyncio.Event()
             self._lines[stop] = (session_id, ended)
-            token = LINE_STOP.set(stop)
+            token = bind_caller(replace(current_caller(), stop=stop))
 
         async def line() -> IOResult:
             result = await self._serialize_line(
@@ -2664,7 +2659,7 @@ class Workspace:
                 del self._lines[stop]
                 self._admitted.discard(stop)
                 ended.set()
-                LINE_STOP.reset(token)
+                reset_caller(token)
         return result
 
 

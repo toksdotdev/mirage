@@ -13,9 +13,8 @@
 // ========= Copyright 2026 @ Strukto.AI All Rights Reserved. =========
 
 import { captureSessionContext } from '../../../context/session_context.ts'
-import { captureOpPolicies } from '../../../policy/policies.ts'
+import { captureExecutionContext } from '../../../execution/context.ts'
 import type { PathSpec } from '../../../types.ts'
-import { captureRecordingContext } from '../../../observe/context.ts'
 import { ContextScope } from '../../../utils/context_scope.ts'
 import { Activity } from '../../../utils/activity.ts'
 import { asyncContextIsolatesTasks } from '../../../utils/async_context.ts'
@@ -260,12 +259,7 @@ export class PyodideRuntime extends PythonRuntime {
       )
     }
     const scope =
-      context?.scope ??
-      new ContextScope([
-        ...captureSessionContext(),
-        ...captureOpPolicies(),
-        ...captureRecordingContext(),
-      ])
+      context?.scope ?? new ContextScope([...captureSessionContext(), captureExecutionContext()])
     return this.schedule(() =>
       this.withPermit(() =>
         scope.run(() =>

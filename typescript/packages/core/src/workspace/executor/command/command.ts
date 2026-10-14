@@ -12,7 +12,12 @@
 // limitations under the License.
 // ========= Copyright 2026 @ Strukto.AI All Rights Reserved. =========
 
-import { getAdmission, sessionAccess } from '../../../context/session_context.ts'
+import {
+  type CallerDispatchFn,
+  currentCaller,
+  getAdmission,
+  sessionAccess,
+} from '../../../context/session_context.ts'
 import type { EntryGate } from '../../../policy/types.ts'
 import type { EvaluationContext } from '../../evaluation.ts'
 import { isBuiltinGrammar, registeredSpec } from '../../../commands/spec/builtins.ts'
@@ -46,7 +51,6 @@ import { ExecutionNode } from '../../types.ts'
 import { RELAY_COMMANDS } from '../../../commands/builtin/generic/crossmount/constants.ts'
 import { aggregateFor } from '../../../commands/builtin/generic/crossmount/detect.ts'
 import { globOptions, resolveGlobs } from '../../expand/globs.ts'
-import type { DispatchFn } from '../../../runtime/types.ts'
 import {
   handleCrossMount,
   isCrossMount,
@@ -61,7 +65,6 @@ import {
 import { resolveNewerRefs } from '../find_refs.ts'
 import type { ExecuteFn } from '../../expand/types.ts'
 import { FindParseError } from '../../../commands/errors.ts'
-import { withDispatchRuleGuard } from '../../../commands/builtin/generic_bind/adapter.ts'
 import { maybeWithTimeout } from '../../../commands/builtin/utils/limit.ts'
 import { resolveProducer, resolveLimit } from '../../../policy/index.ts'
 import {
@@ -136,7 +139,7 @@ async function finishFind(
   executeFn: ExecuteFn | undefined,
   ns: NamespaceView | undefined,
   statPath: StatPath,
-  dispatch: DispatchFn,
+  dispatch: CallerDispatchFn,
   stdin: ByteSource | null,
   starts: readonly PathSpec[],
   signal: AbortSignal | undefined,
@@ -176,7 +179,7 @@ function spelledWords(parts: readonly (string | PathSpec)[]): string[] {
 
 export async function handleCommand(
   executeNode: ExecuteNodeFn,
-  dispatch: DispatchFn,
+  dispatch: CallerDispatchFn,
   registry: MountRegistry,
   parts: readonly (string | PathSpec)[],
   context: EvaluationContext,
@@ -245,10 +248,19 @@ export async function handleCommand(
     )
   }
 
-  // Every op the command or CLI issues from here carries its gate to the
-  // dispatcher, so a rule scoped to a CLI reaches its own reads, and so does
-  // every mount run below: one run, a fan-out or a cross-mount.
-  dispatch = withDispatchRuleGuard(dispatch, admission)
+  // Every op the command or CLI issues from here is made by the command,
+  // its gate included, so a rule scoped to a CLI reaches its own reads, and
+  // so does every mount run below: one run, a fan-out or a cross-mount.
+  const commandDispatch = dispatch
+  dispatch = (op, path, args, kwargs, report, caller) =>
+    commandDispatch(
+      op,
+      path,
+      args,
+      kwargs,
+      report,
+      caller ?? { ...currentCaller(), ruleGate: admission },
+    )
 
   // Installed CLIs: dispatch by name, never by operand path. Sits
   // below functions (a user can wrap an installed CLI, bash-style)

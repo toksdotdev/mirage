@@ -13,10 +13,15 @@
 // ========= Copyright 2026 @ Strukto.AI All Rights Reserved. =========
 
 import { makeAbortError, mergeSignals } from '../utils/abort.ts'
-import { getCurrentEvaluation, getCurrentSession } from '../context/session_context.ts'
+import {
+  type CallerDispatchFn,
+  currentCaller,
+  getCurrentEvaluation,
+  getCurrentSession,
+  liveCallers,
+  runWithCaller,
+} from '../context/session_context.ts'
 import type { StatusWriter } from './types.ts'
-import type { DispatchFn } from '../runtime/types.ts'
-import { createAsyncContext } from '../utils/async_context.ts'
 import type { SessionState } from './session/session.ts'
 
 /**
@@ -28,13 +33,19 @@ import type { SessionState } from './session/session.ts'
  * statement that settles after its caller was released still reads the
  * signal of the line that produced it.
  */
-interface LineAbortFrame {
+export interface LineAbortFrame {
   signal: AbortSignal | undefined
   sessions: readonly SessionState[]
   writer: StatusWriter
 }
 
-const lineAbortContext = createAsyncContext<LineAbortFrame>()
+// The line's abort on the caller: added here, where LineAbortFrame lives,
+// so the caller's module imports no workspace module.
+declare module '../context/session_context.ts' {
+  interface Caller {
+    readonly lineAbort: LineAbortFrame | null
+  }
+}
 
 /**
  * Run `fn` as the body of the line `signal` belongs to. Everything the
@@ -48,7 +59,7 @@ export function runWithLineAbort<T>(
   writer: StatusWriter,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return Promise.resolve(lineAbortContext.run({ signal, sessions, writer }, fn))
+  return runWithCaller({ ...currentCaller(), lineAbort: { signal, sessions, writer } }, fn)
 }
 
 /**
@@ -62,13 +73,13 @@ export function runWithLineAbort<T>(
  * line declines to restore rather than guess.
  */
 export function lineStatusWriter(session: SessionState): StatusWriter | null {
-  const frames = lineAbortContext.liveStores().filter((f) => f.sessions.includes(session))
+  const frames = lineFrames().filter((f) => f.sessions.includes(session))
   return frames.length === 1 ? (frames[0]?.writer ?? null) : null
 }
 
 /** The active line's cancellation channel, when it can be attributed to this session. */
 export function lineSignal(session: SessionState): AbortSignal | undefined {
-  const frames = lineAbortContext.liveStores().filter((frame) => frame.sessions.includes(session))
+  const frames = lineFrames().filter((frame) => frame.sessions.includes(session))
   return frames.length === 1 ? frames[0]?.signal : undefined
 }
 
@@ -101,7 +112,7 @@ export function callerSignal(): AbortSignal | undefined {
  * without task isolation, where the fallback cannot tell them apart.
  */
 export function abortedLine(session: SessionState): AbortSignal | undefined {
-  const frames = lineAbortContext.liveStores().filter((f) => f.sessions.includes(session))
+  const frames = lineFrames().filter((f) => f.sessions.includes(session))
   if (frames.length === 0) return undefined
   const aborted = frames.filter((f) => f.signal?.aborted === true)
   return aborted.length === frames.length ? aborted[0]?.signal : undefined
@@ -117,12 +128,27 @@ export function abortedLine(session: SessionState): AbortSignal | undefined {
  * stops it there without threading the signal through each handler. An
  * op already in flight settles on its own.
  */
-export function guardDispatch(dispatch: DispatchFn, signal: AbortSignal | undefined): DispatchFn {
+export function guardDispatch(
+  dispatch: CallerDispatchFn,
+  signal: AbortSignal | undefined,
+): CallerDispatchFn {
   if (signal === undefined) return dispatch
-  return (op, path, args, kwargs, report) => {
+  return (op, path, args, kwargs, report, caller) => {
     if (signal.aborted) return Promise.reject(makeAbortError(signal))
-    return dispatch(op, path, args, kwargs, report)
+    return dispatch(op, path, args, kwargs, report, caller)
   }
+}
+
+/**
+ * Every line frame live in this context, oldest first, each once: on the
+ * fallback storage the layers of one line each copy its frame.
+ */
+function lineFrames(): LineAbortFrame[] {
+  return [
+    ...new Set(
+      liveCallers().flatMap((caller) => (caller.lineAbort === null ? [] : [caller.lineAbort])),
+    ),
+  ]
 }
 
 /** A fresh line identity. */
