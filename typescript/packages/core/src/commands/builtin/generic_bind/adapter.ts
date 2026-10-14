@@ -561,6 +561,7 @@ export function resolveGlobOf<A extends Accessor = Accessor>(ops: CommandIO<A>):
     ops.stat,
     ops.globTargetStat,
     ops.access,
+    ops.globFollow,
   )
 }
 
